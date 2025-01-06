@@ -37208,6 +37208,18 @@ exception:
     return JS_EXCEPTION;
 }
 
+JSValue JS_SealObject(JSContext *ctx, JSValue obj)
+{
+    JS_FreeValue(ctx, js_object_seal(ctx, JS_UNDEFINED, 1, &obj, 0));
+    return obj;
+}
+
+JSValue JS_FreezeObject(JSContext *ctx, JSValue obj)
+{
+    JS_FreeValue(ctx, js_object_seal(ctx, JS_UNDEFINED, 1, &obj, 1));
+    return obj;
+}
+
 static JSValue js_object_fromEntries(JSContext *ctx, JSValue this_val,
                                      int argc, JSValue *argv)
 {

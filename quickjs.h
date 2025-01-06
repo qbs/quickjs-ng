@@ -1116,6 +1116,14 @@ JS_EXTERN int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *exp
 JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
                                      const JSCFunctionListEntry *tab, int len);
 
+// Alternative: Request with throw in script engine
+typedef void FoundUndefinedHandler(JSContext *ctx);
+void setFoundUndefinedHandler(JSContext *ctx, FoundUndefinedHandler *handler);
+typedef void FunctionEnteredHandler(JSContext *ctx, JSValue this_val);
+typedef void FunctionExitedHandler(JSContext *ctx);
+void setFunctionEnteredHandler(JSContext *ctx, FunctionEnteredHandler *handler);
+void setFunctionExitedHandler(JSContext *ctx, FunctionExitedHandler *handler);
+
 /* Version */
 
 #define QJS_VERSION_MAJOR 0

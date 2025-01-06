@@ -2845,6 +2845,8 @@ void JS_FreeRuntime(JSRuntime *rt)
         rt->mf.js_free(ms->opaque, rt);
     }
 
+    fflush(stdout);
+
     if (leak)
         abort();
 }

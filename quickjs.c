@@ -2319,6 +2319,7 @@ void JS_FreeRuntime(JSRuntime *rt)
         JSMallocState *ms = &rt->malloc_state;
         rt->mf.js_free(ms->opaque, rt);
     }
+    fflush(stdout);
 }
 
 JSContext *JS_NewContextRaw(JSRuntime *rt)

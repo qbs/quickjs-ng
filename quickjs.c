@@ -474,6 +474,10 @@ struct JSContext {
                              const char *input, size_t input_len,
                              const char *filename, int flags, int scope_idx);
     void *user_opaque;
+
+    FoundUndefinedHandler *handleUndefined;
+    FunctionEnteredHandler *handleFunctionEntered;
+    FunctionExitedHandler *handleFunctionExited;
 };
 
 typedef union JSFloat64Union {
@@ -7471,6 +7475,8 @@ static JSValue JS_GetPropertyInternal2(JSContext *ctx, JSValue obj,
                     continue;
                 }
             } else {
+                if (JS_IsUndefined(pr->u.value) && ctx->handleUndefined)
+                    ctx->handleUndefined(ctx);
                 if (proto_depth == 0)
                     add_ic_slot(ctx, icu, prop, p, offset);
                 return js_dup(pr->u.value);
@@ -15038,6 +15044,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
     ctx = b->realm; /* set the current realm */
     ic = b->ic;
 
+    if (ctx->handleFunctionEntered)
+        ctx->handleFunctionEntered(ctx, this_obj);
+
 #ifdef DUMP_BYTECODE_STEP
     if (check_dump_flag(ctx->rt, DUMP_BYTECODE_STEP))
         print_func_name(b);
@@ -17522,6 +17531,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
         }
     }
     rt->current_stack_frame = sf->prev_frame;
+    if (ctx->handleFunctionExited)
+        ctx->handleFunctionExited(ctx);
     return ret_val;
 }
 
@@ -56171,6 +56182,21 @@ BOOL JS_DetectModule(const char *input, size_t input_len)
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return is_module;
+}
+
+void setFoundUndefinedHandler(JSContext *ctx, FoundUndefinedHandler *handler)
+{
+    ctx->handleUndefined = handler;
+}
+
+void setFunctionEnteredHandler(JSContext *ctx, FunctionEnteredHandler *handler)
+{
+    ctx->handleFunctionEntered = handler;
+}
+
+void setFunctionExitedHandler(JSContext *ctx, FunctionExitedHandler *handler)
+{
+    ctx->handleFunctionExited = handler;
 }
 
 uintptr_t js_std_cmd(int cmd, ...) {

@@ -1420,8 +1420,6 @@ static JSValue js_int64(int64_t v)
         return js_float64(v);
 }
 
-#define JS_NewInt64(ctx, val)  js_int64(val)
-
 static JSValue js_number(double d)
 {
     if (double_is_int32(d))
@@ -7403,7 +7401,7 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
-static JSValue JS_GetPropertyInternal2(JSContext *ctx, JSValue obj,
+JSValue JS_GetPropertyInternal2(JSContext *ctx, JSValue obj,
                                        JSAtom prop, JSValue this_obj,
                                        JSInlineCacheUpdate *icu,
                                        BOOL throw_ref_error)
@@ -7553,7 +7551,7 @@ static JSValue JS_GetPropertyInternal2(JSContext *ctx, JSValue obj,
     }
 }
 
-static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValue obj,
+JSValue JS_GetPropertyInternal(JSContext *ctx, JSValue obj,
                                       JSAtom prop, JSValue this_obj,
                                       BOOL throw_ref_error)
 {
@@ -8734,7 +8732,7 @@ static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
    the new property is not added and an error is raised.
    'obj' must be an object when obj != this_obj.
    */
-static int JS_SetPropertyInternal2(JSContext *ctx, JSValue obj, JSAtom prop,
+int JS_SetPropertyInternal2(JSContext *ctx, JSValue obj, JSAtom prop,
                                    JSValue val, JSValue this_obj, int flags,
                                    JSInlineCacheUpdate *icu)
 {
@@ -8984,7 +8982,7 @@ fail:
     return -1;
 }
 
-static int JS_SetPropertyInternal(JSContext *ctx, JSValue this_obj,
+int JS_SetPropertyInternal(JSContext *ctx, JSValue this_obj,
                                   JSAtom prop, JSValue val, int flags)
 {
     return JS_SetPropertyInternal2(ctx, this_obj, prop, val, this_obj,
@@ -56225,6 +56223,92 @@ void setFunctionEnteredHandler(JSContext *ctx, FunctionEnteredHandler *handler)
 void setFunctionExitedHandler(JSContext *ctx, FunctionExitedHandler *handler)
 {
     ctx->handleFunctionExited = handler;
+}
+
+JSValue JS_NewCFunctionMagic(JSContext *ctx, JSCFunctionMagic *func,
+                             const char *name,
+                             int length, JSCFunctionEnum cproto, int magic)
+{
+    /* Used to squelch a -Wcast-function-type warning. */
+    JSCFunctionType ft;
+    ft.generic_magic = func;
+    return JS_NewCFunction2(ctx, ft.generic, name, length, cproto, magic);
+}
+
+JSValue JS_NewCFunction(JSContext *ctx, JSCFunction *func, const char *name,
+                        int length)
+{
+    return JS_NewCFunction2(ctx, func, name, length, JS_CFUNC_generic, 0);
+}
+
+#ifdef JS_NAN_BOXING
+JSValue mkVal(int32_t tag, int32_t val)
+{
+    return ((uint64_t)(tag) << 32) | (uint32_t)(val);
+}
+
+JSValue mkPtr(int32_t tag, void *p)
+{
+    return ((uint64_t)(tag) << 32) | (uintptr_t)(p);
+}
+
+#else
+
+JSValue mkVal(int32_t tag, int32_t val)
+{
+    return (JSValue){ (JSValueUnion){ .int32 = val }, tag };
+}
+
+JSValue mkPtr(int32_t tag, void *p)
+{
+    return (JSValue){ (JSValueUnion){ .ptr = p }, tag };
+}
+#endif
+
+JSValue JS_NewBool(JSContext *ctx, JS_BOOL val)
+{
+    (void)&ctx;
+    return JS_MKVAL(JS_TAG_BOOL, (val != 0));
+}
+
+JSValue JS_NewInt32(JSContext *ctx, int32_t val)
+{
+    (void)&ctx;
+    return JS_MKVAL(JS_TAG_INT, val);
+}
+
+JSValue JS_NewFloat64(JSContext *ctx, double val)
+{
+    (void)&ctx;
+    return __JS_NewFloat64(val);
+}
+
+JSValue JS_NewCatchOffset(JSContext *ctx, int32_t val)
+{
+    (void)&ctx;
+    return JS_MKVAL(JS_TAG_CATCH_OFFSET, val);
+}
+
+JSValue JS_NewInt64(JSContext *ctx, int64_t val)
+{
+    JSValue v;
+    if (val >= INT32_MIN && val <= INT32_MAX) {
+        v = JS_NewInt32(ctx, (int32_t)val);
+    } else {
+        v = JS_NewFloat64(ctx, (double)val);
+    }
+    return v;
+}
+
+JSValue JS_NewUint32(JSContext *ctx, uint32_t val)
+{
+    JSValue v;
+    if (val <= INT32_MAX) {
+        v = JS_NewInt32(ctx, (int32_t)val);
+    } else {
+        v = JS_NewFloat64(ctx, (double)val);
+    }
+    return v;
 }
 
 uintptr_t js_std_cmd(int cmd, ...) {

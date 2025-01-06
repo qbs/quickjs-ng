@@ -176,38 +176,11 @@ typedef struct JSValue {
 #define JS_VALUE_GET_FLOAT64(v) ((v).u.float64)
 #define JS_VALUE_GET_PTR(v) ((v).u.ptr)
 
-/* msvc doesn't understand designated initializers without /std:c++20 */
-#ifdef __cplusplus
-static inline JSValue JS_MKPTR(int64_t tag, void *ptr)
-{
-    JSValue v;
-    v.u.ptr = ptr;
-    v.tag = tag;
-    return v;
-}
-static inline JSValue JS_MKVAL(int64_t tag, int32_t int32)
-{
-    JSValue v;
-    v.u.int32 = int32;
-    v.tag = tag;
-    return v;
-}
-static inline JSValue JS_MKNAN(void)
-{
-    JSValue v;
-    v.u.float64 = JS_FLOAT64_NAN;
-    v.tag = JS_TAG_FLOAT64;
-    return v;
-}
-/* provide as macros for consistency and backward compat reasons */
-#define JS_MKPTR(tag, ptr) JS_MKPTR(tag, ptr)
-#define JS_MKVAL(tag, val) JS_MKVAL(tag, val)
-#define JS_NAN             JS_MKNAN() /* alas, not a constant expression */
-#else
-#define JS_MKPTR(tag, p)   (JSValue){ (JSValueUnion){ .ptr = p }, tag }
-#define JS_MKVAL(tag, val) (JSValue){ (JSValueUnion){ .int32 = val }, tag }
+JS_EXTERN JSValue mkVal(int32_t tag, int32_t val);
+JS_EXTERN JSValue mkPtr(int32_t tag, void *p);
+#define JS_MKVAL(tag, val) mkVal(tag, val)
+#define JS_MKPTR(tag, p) mkPtr(tag, p)
 #define JS_NAN             (JSValue){ (JSValueUnion){ .float64 = JS_FLOAT64_NAN }, JS_TAG_FLOAT64 }
-#endif
 
 #define JS_TAG_IS_FLOAT64(tag) ((unsigned)(tag) == JS_TAG_FLOAT64)
 
@@ -510,51 +483,17 @@ JS_EXTERN int JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id);
 
 /* value handling */
 
-static js_force_inline JSValue JS_NewBool(JSContext *ctx, JS_BOOL val)
-{
-    (void)&ctx;
-    return JS_MKVAL(JS_TAG_BOOL, (val != 0));
-}
+JS_EXTERN JSValue JS_NewBool(JSContext *ctx, JS_BOOL val);
 
-static js_force_inline JSValue JS_NewInt32(JSContext *ctx, int32_t val)
-{
-    (void)&ctx;
-    return JS_MKVAL(JS_TAG_INT, val);
-}
+JS_EXTERN JSValue JS_NewInt32(JSContext *ctx, int32_t val);
 
-static js_force_inline JSValue JS_NewFloat64(JSContext *ctx, double val)
-{
-    (void)&ctx;
-    return __JS_NewFloat64(val);
-}
+JS_EXTERN JSValue JS_NewFloat64(JSContext *ctx, double val);
 
-static js_force_inline JSValue JS_NewCatchOffset(JSContext *ctx, int32_t val)
-{
-    (void)&ctx;
-    return JS_MKVAL(JS_TAG_CATCH_OFFSET, val);
-}
+JS_EXTERN JSValue JS_NewCatchOffset(JSContext *ctx, int32_t val);
 
-static js_force_inline JSValue JS_NewInt64(JSContext *ctx, int64_t val)
-{
-    JSValue v;
-    if (val >= INT32_MIN && val <= INT32_MAX) {
-        v = JS_NewInt32(ctx, (int32_t)val);
-    } else {
-        v = JS_NewFloat64(ctx, (double)val);
-    }
-    return v;
-}
+JS_EXTERN JSValue JS_NewInt64(JSContext *ctx, int64_t val);
 
-static js_force_inline JSValue JS_NewUint32(JSContext *ctx, uint32_t val)
-{
-    JSValue v;
-    if (val <= INT32_MAX) {
-        v = JS_NewInt32(ctx, (int32_t)val);
-    } else {
-        v = JS_NewFloat64(ctx, (double)val);
-    }
-    return v;
-}
+JS_EXTERN JSValue JS_NewUint32(JSContext *ctx, uint32_t val);
 
 JS_EXTERN JSValue JS_NewNumber(JSContext *ctx, double d);
 JS_EXTERN JSValue JS_NewBigInt64(JSContext *ctx, int64_t v);
@@ -949,21 +888,12 @@ JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                       int length, int magic, int data_len,
                                       JSValue *data);
 
-static inline JSValue JS_NewCFunction(JSContext *ctx, JSCFunction *func, const char *name,
-                                      int length)
-{
-    return JS_NewCFunction2(ctx, func, name, length, JS_CFUNC_generic, 0);
-}
+JS_EXTERN JSValue JS_NewCFunction(JSContext *ctx, JSCFunction *func, const char *name, int length);
 
-static inline JSValue JS_NewCFunctionMagic(JSContext *ctx, JSCFunctionMagic *func,
-                                           const char *name,
-                                           int length, JSCFunctionEnum cproto, int magic)
-{
-    /* Used to squelch a -Wcast-function-type warning. */
-    JSCFunctionType ft;
-    ft.generic_magic = func;
-    return JS_NewCFunction2(ctx, ft.generic, name, length, cproto, magic);
-}
+JS_EXTERN JSValue JS_NewCFunctionMagic(JSContext *ctx, JSCFunctionMagic *func,
+                                       const char *name,
+                                       int length, JSCFunctionEnum cproto, int magic);
+
 JS_EXTERN void JS_SetConstructor(JSContext *ctx, JSValue func_obj,
                                  JSValue proto);
 

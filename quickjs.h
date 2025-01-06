@@ -743,6 +743,7 @@ JS_EXTERN bool JS_SetConstructorBit(JSContext *ctx, JSValue func_obj, bool val);
 
 JS_EXTERN bool JS_IsRegExp(JSValue val);
 JS_EXTERN bool JS_IsMap(JSValue val);
+JS_EXTERN int JS_IsSimpleValue(JSContext* ctx, JSValue v);
 
 JS_EXTERN JSValue JS_NewArray(JSContext *ctx);
 // takes ownership of the values

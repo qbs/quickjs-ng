@@ -41,6 +41,17 @@
 #include <fenv.h>
 #include <math.h>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#include <windows.h>
+#endif
+#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__) \
+    || defined(__APPLE__)
+#include <xlocale.h>
+#else
+#include <locale.h>
+#endif
+
 #include "cutils.h"
 #include "list.h"
 #include "quickjs.h"
@@ -95,6 +106,25 @@ const char* JS_GetVersion(void) {
 
 #undef STRINFIGY_
 #undef STRINGIFY
+
+static double safe_strtod(const char *restrict nptr, char **restrict endptr)
+{
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
+    setlocale(LC_NUMERIC, "C");
+#else
+    const locale_t tempLoc = newlocale(LC_NUMERIC_MASK, "C", 0);
+    uselocale(tempLoc);
+#endif
+    double d = strtod(nptr, endptr);
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    _configthreadlocale(_DISABLE_PER_THREAD_LOCALE);
+#else
+    uselocale(LC_GLOBAL_LOCALE);
+    freelocale(tempLoc);
+#endif
+    return d;
+}
 
 enum {
     /* classid tag        */    /* union usage   | properties */
@@ -10442,7 +10472,7 @@ static double js_strtod(const char *str, int radix, bool is_float)
             d = -d;
     } else {
     strtod_case:
-        d = strtod(str, NULL);
+        d = safe_strtod(str, NULL);
     }
     return d;
 }
@@ -11388,7 +11418,7 @@ static int js_ecvt(double d, int n_digits,
                n_digits+1:   'e' exponent mark
                n_digits+2..: exponent sign, value and null terminator
              */
-            if (strtod(dest, NULL) == d) {
+            if (safe_strtod(dest, NULL) == d) {
                 unsigned int n0 = n_digits;
                 /* enough digits */
                 /* strip the trailing zeros */
@@ -20119,7 +20149,7 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             p++;
     }
     s->token.val = TOK_NUMBER;
-    s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    s->token.u.num.val = js_float64(safe_strtod((const char *)p_start, NULL));
     *pp = p;
     return 0;
 }

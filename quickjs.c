@@ -10169,6 +10169,15 @@ JS_BOOL JS_IsMap(JSValue val)
     return JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_MAP;
 }
 
+int JS_IsSimpleValue(JSContext* ctx, JSValue v)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return 1;
+    p = JS_VALUE_GET_OBJ(v);
+    return p->class_id >= JS_CLASS_OBJECT && p->class_id <= JS_CLASS_BOOLEAN;
+}
+
 BOOL JS_IsError(JSContext *ctx, JSValue val)
 {
     JSObject *p;

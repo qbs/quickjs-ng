@@ -617,7 +617,7 @@ struct JSContext {
                              const char *input, size_t input_len,
                              const char *filename, int line, int flags, int scope_idx);
     void *user_opaque;
-
+    ScopeLookup *scopeLookup;
     FoundUndefinedHandler *handleUndefined;
     FunctionEnteredHandler *handleFunctionEntered;
     FunctionExitedHandler *handleFunctionExited;
@@ -11787,6 +11787,12 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
         return js_dup(pr->u.value);
     }
 
+    if (ctx->scopeLookup) {
+        struct LookupResult result = ctx->scopeLookup(ctx, prop);
+        if (result.useResult)
+            return result.value;
+    }
+
     /* fast path */
     p = JS_VALUE_GET_OBJ(ctx->global_obj);
     prs = find_own_property(&pr, p, prop);
@@ -11794,6 +11800,7 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
         if (likely((prs->flags & JS_PROP_TMASK) == 0))
             return js_dup(pr->u.value);
     }
+
     return JS_GetPropertyInternal(ctx, ctx->global_obj, prop,
                                  ctx->global_obj, throw_ref_error);
 }
@@ -11866,6 +11873,20 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
         return 0;
     }
 
+    /* The scope lookup must be consulted before any access to global_obj,
+       including the fast path below: a scoped value takes precedence over an
+       own property of the global object with the same name. */
+    if (ctx->scopeLookup) {
+        struct LookupResult result = ctx->scopeLookup(ctx, prop);
+        if (result.useResult) {
+            int flags = JS_PROP_THROW_STRICT;
+            if (is_strict_mode(ctx))
+                flags |= JS_PROP_NO_ADD;
+            JS_FreeValue(ctx, result.value);
+            return JS_SetPropertyInternal2(ctx, ctx->global_obj, prop, val, result.scope, flags);
+        }
+    }
+
     p = JS_VALUE_GET_OBJ(ctx->global_obj);
     prs = find_own_property(&pr, p, prop);
     if (prs) {
@@ -11876,6 +11897,7 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
             return 0;
         }
     }
+
     /* slow path */
     ret = JS_HasProperty(ctx, ctx->global_obj, prop);
     if (ret < 0) {
@@ -11887,8 +11909,7 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
         JS_ThrowReferenceErrorNotDefined(ctx, prop);
         return -1;
     }
-    return JS_SetPropertyInternal(ctx, ctx->global_obj, prop, val,
-                                  JS_PROP_THROW_STRICT);
+    return JS_SetPropertyInternal(ctx, ctx->global_obj, prop, val, JS_PROP_THROW_STRICT);
 }
 
 /* return -1, false or true */
@@ -64824,6 +64845,11 @@ bool JS_DetectModule(const char *input, size_t input_len)
 #else
     return false;
 #endif // QJS_DISABLE_PARSER
+}
+
+void setScopeLookup(JSContext *ctx, ScopeLookup *scopeLookup)
+{
+    ctx->scopeLookup = scopeLookup;
 }
 
 void setFoundUndefinedHandler(JSContext *ctx, FoundUndefinedHandler *handler)

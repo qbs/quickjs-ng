@@ -454,7 +454,7 @@ struct JSContext {
                              const char *input, size_t input_len,
                              const char *filename, int line, int flags, int scope_idx);
     void *user_opaque;
-
+    ScopeLookup *scopeLookup;
     FoundUndefinedHandler *handleUndefined;
     FunctionEnteredHandler *handleFunctionEntered;
     FunctionExitedHandler *handleFunctionExited;
@@ -9949,6 +9949,11 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
             return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
         return js_dup(pr->u.value);
     }
+    if (ctx->scopeLookup) {
+        struct LookupResult result = ctx->scopeLookup(ctx, prop);
+        if (result.useResult)
+            return result.value;
+    }
     return JS_GetPropertyInternal(ctx, ctx->global_obj, prop,
                                  ctx->global_obj, throw_ref_error);
 }
@@ -10044,6 +10049,15 @@ static int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
     flags = JS_PROP_THROW_STRICT;
     if (is_strict_mode(ctx))
         flags |= JS_PROP_NO_ADD;
+
+    if (ctx->scopeLookup) {
+        struct LookupResult result = ctx->scopeLookup(ctx, prop);
+        if (result.useResult) {
+            JS_FreeValue(ctx, result.value);
+            return JS_SetPropertyInternal2(ctx, ctx->global_obj, prop, val, result.scope, flags, NULL);
+        }
+    }
+
     return JS_SetPropertyInternal(ctx, ctx->global_obj, prop, val, flags);
 }
 
@@ -56248,6 +56262,11 @@ bool JS_DetectModule(const char *input, size_t input_len)
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return is_module;
+}
+
+void setScopeLookup(JSContext *ctx, ScopeLookup *scopeLookup)
+{
+    ctx->scopeLookup = scopeLookup;
 }
 
 void setFoundUndefinedHandler(JSContext *ctx, FoundUndefinedHandler *handler)

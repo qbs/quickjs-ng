@@ -1116,6 +1116,16 @@ JS_EXTERN int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *exp
 JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
                                      const JSCFunctionListEntry *tab, int len);
 
+/* Qbs extensions */
+struct LookupResult
+{
+    JSValue value;
+    JSValue scope;
+    int useResult;
+};
+typedef struct LookupResult ScopeLookup(JSContext *ctx, JSAtom prop);
+void setScopeLookup(JSContext *ctx, ScopeLookup *scopeLookup);
+
 // Alternative: Request with throw in script engine
 typedef void FoundUndefinedHandler(JSContext *ctx);
 void setFoundUndefinedHandler(JSContext *ctx, FoundUndefinedHandler *handler);

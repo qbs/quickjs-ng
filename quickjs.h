@@ -845,6 +845,8 @@ JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
 JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
 JS_EXTERN bool JS_IsDataView(JSValueConst val);
 
+JS_EXTERN int JS_IsSimpleValue(JSContext* ctx, JSValueConst v);
+
 JS_EXTERN JSValue JS_NewArray(JSContext *ctx);
 // takes ownership of the values
 JS_EXTERN JSValue JS_NewArrayFrom(JSContext *ctx, int count,

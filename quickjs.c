@@ -10372,6 +10372,15 @@ bool JS_IsDataView(JSValueConst val)
     return JS_CLASS_DATAVIEW == JS_GetClassID(val);
 }
 
+int JS_IsSimpleValue(JSContext* ctx, JSValueConst v)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return 1;
+    p = JS_VALUE_GET_OBJ(v);
+    return p->class_id >= JS_CLASS_OBJECT && p->class_id <= JS_CLASS_BOOLEAN;
+}
+
 bool JS_IsError(JSContext *ctx, JSValueConst val)
 {
     return JS_CLASS_ERROR == JS_GetClassID(val);

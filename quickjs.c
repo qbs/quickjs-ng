@@ -37239,6 +37239,13 @@ exception:
     return JS_EXCEPTION;
 }
 
+JSValue JS_ObjectSeal(JSContext *ctx, JSValueConst obj, int freeze)
+{
+    JSValueConst argv[] = {obj};
+    JS_FreeValue(ctx, js_object_seal(ctx, JS_UNDEFINED, 1, argv, freeze));
+    return obj;
+}
+
 static JSValue js_object_fromEntries(JSContext *ctx, JSValue this_val,
                                      int argc, JSValue *argv)
 {

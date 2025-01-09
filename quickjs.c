@@ -7058,14 +7058,14 @@ static JSValue JS_ThrowTypeErrorNotASymbol(JSContext *ctx)
 static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
-    return JS_ThrowReferenceError(ctx, "%s is not defined",
+    return JS_ThrowReferenceError(ctx, "'%s' is not defined",
                                   JS_AtomGetStr(ctx, buf, sizeof(buf), name));
 }
 
 static JSValue JS_ThrowReferenceErrorUninitialized(JSContext *ctx, JSAtom name)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
-    return JS_ThrowReferenceError(ctx, "%s is not initialized",
+    return JS_ThrowReferenceError(ctx, "'%s' is not initialized",
                                   name == JS_ATOM_NULL ? "lexical variable" :
                                   JS_AtomGetStr(ctx, buf, sizeof(buf), name));
 }
@@ -7090,7 +7090,7 @@ static JSValue JS_ThrowTypeErrorInvalidClass(JSContext *ctx, int class_id)
     JSRuntime *rt = ctx->rt;
     JSAtom name;
     name = rt->class_array[class_id].class_name;
-    return JS_ThrowTypeErrorAtom(ctx, "%s object expected", name);
+    return JS_ThrowTypeErrorAtom(ctx, "'%s' object expected", name);
 }
 
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)

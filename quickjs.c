@@ -6528,6 +6528,14 @@ bool JS_HasException(JSContext *ctx)
     return !JS_IsUninitialized(ctx->rt->current_exception);
 }
 
+/* returns the pending backtrace (cannot be called twice). */
+JSValue JS_GetBacktrace(JSContext *ctx)
+{
+    JSValue val = ctx->error_back_trace;
+    ctx->error_back_trace = JS_UNDEFINED;
+    return val;
+}
+
 static void dbuf_put_leb128(DynBuf *s, uint32_t v)
 {
     uint32_t a;

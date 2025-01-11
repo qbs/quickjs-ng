@@ -6866,6 +6866,8 @@ static void build_backtrace(JSContext *ctx, JSValue error_val, JSValue filter_fu
     if (can_add_backtrace(error_val)) {
         JS_DefinePropertyValue(ctx, error_val, JS_ATOM_stack, stack,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    } else {
+        JS_FreeValue(ctx, stack);
     }
 }
 

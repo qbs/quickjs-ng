@@ -33,12 +33,24 @@
 #if !defined(_MSC_VER)
 #include <sys/time.h>
 #if defined(_WIN32)
+#include <intrin.h>
 #include <timezoneapi.h>
 #endif
 #endif
 #include <time.h>
 #include <fenv.h>
 #include <math.h>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#include <windows.h>
+#endif
+#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__) \
+    || defined(__APPLE__)
+#include <xlocale.h>
+#else
+#include <locale.h>
+#endif
 
 #include "cutils.h"
 #include "list.h"
@@ -115,6 +127,25 @@ const char* JS_GetVersion(void) {
 
 #undef STRINFIGY_
 #undef STRINGIFY
+
+static double safe_strtod(const char *restrict nptr, char **restrict endptr)
+{
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
+    setlocale(LC_NUMERIC, "C");
+#else
+    const locale_t tempLoc = newlocale(LC_NUMERIC_MASK, "C", 0);
+    uselocale(tempLoc);
+#endif
+    double d = strtod(nptr, endptr);
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    _configthreadlocale(_DISABLE_PER_THREAD_LOCALE);
+#else
+    uselocale(LC_GLOBAL_LOCALE);
+    freelocale(tempLoc);
+#endif
+    return d;
+}
 
 enum {
     /* classid tag        */    /* union usage   | properties */
@@ -414,6 +445,7 @@ struct JSContext {
     JSValue promise_ctor;
     JSValue native_error_proto[JS_NATIVE_ERROR_COUNT];
     JSValue error_ctor;
+    JSValue error_back_trace;
     JSValue error_prepare_stack;
     int error_stack_trace_limit;
     JSValue iterator_ctor;
@@ -441,8 +473,12 @@ struct JSContext {
     /* if NULL, eval is not supported */
     JSValue (*eval_internal)(JSContext *ctx, JSValue this_obj,
                              const char *input, size_t input_len,
-                             const char *filename, int flags, int scope_idx);
+                             const char *filename, int line, int flags, int scope_idx);
     void *user_opaque;
+    ScopeLookup *scopeLookup;
+    FoundUndefinedHandler *handleUndefined;
+    FunctionEnteredHandler *handleFunctionEntered;
+    FunctionExitedHandler *handleFunctionExited;
 };
 
 typedef union JSFloat64Union {
@@ -1255,7 +1291,7 @@ static void js_async_function_resolve_mark(JSRuntime *rt, JSValue val,
                                            JS_MarkFunc *mark_func);
 static JSValue JS_EvalInternal(JSContext *ctx, JSValue this_obj,
                                const char *input, size_t input_len,
-                               const char *filename, int flags, int scope_idx);
+                               const char *filename, int line, int flags, int scope_idx);
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
 static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                JS_MarkFunc *mark_func);
@@ -1384,8 +1420,6 @@ static JSValue js_int64(int64_t v)
     else
         return js_float64(v);
 }
-
-#define JS_NewInt64(ctx, val)  js_int64(val)
 
 static JSValue js_number(double d)
 {
@@ -1774,10 +1808,23 @@ static int init_class_range(JSRuntime *rt, JSClassShortDef const *tab,
     return 0;
 }
 
-/* Note: OS and CPU dependent */
+/* Uses code from LLVM project. */
 static inline uintptr_t js_get_stack_pointer(void)
 {
+#if defined(__clang__) || defined(__GNUC__)
     return (uintptr_t)__builtin_frame_address(0);
+#elif defined(_MSC_VER)
+    return (uintptr_t)_AddressOfReturnAddress();
+#else
+    char CharOnStack = 0;
+    // The volatile store here is intended to escape the local variable, to
+    // prevent the compiler from optimizing CharOnStack into anything other
+    // than a char on the stack.
+    //
+    // Tested on: MSVC 2015 - 2019, GCC 4.9 - 9, Clang 3.2 - 9, ICC 13 - 19.
+    char *volatile Ptr = &CharOnStack;
+    return (uintptr_t) Ptr;
+#endif
 }
 
 static inline BOOL js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
@@ -2275,6 +2322,7 @@ void JS_FreeRuntime(JSRuntime *rt)
         JSMallocState *ms = &rt->malloc_state;
         rt->mf.js_free(ms->opaque, rt);
     }
+    fflush(stdout);
 }
 
 JSContext *JS_NewContextRaw(JSRuntime *rt)
@@ -2304,6 +2352,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->regexp_ctor = JS_NULL;
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
+    ctx->error_back_trace = JS_UNDEFINED;
     ctx->error_prepare_stack = JS_UNDEFINED;
     ctx->error_stack_trace_limit = 10;
     init_list_head(&ctx->loaded_modules);
@@ -2423,6 +2472,7 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
         JS_MarkValue(rt, ctx->native_error_proto[i], mark_func);
     }
     JS_MarkValue(rt, ctx->error_ctor, mark_func);
+    JS_MarkValue(rt, ctx->error_back_trace, mark_func);
     JS_MarkValue(rt, ctx->error_prepare_stack, mark_func);
     for(i = 0; i < rt->class_count; i++) {
         JS_MarkValue(rt, ctx->class_proto[i], mark_func);
@@ -2490,6 +2540,7 @@ void JS_FreeContext(JSContext *ctx)
         JS_FreeValue(ctx, ctx->native_error_proto[i]);
     }
     JS_FreeValue(ctx, ctx->error_ctor);
+    JS_FreeValue(ctx, ctx->error_back_trace);
     JS_FreeValue(ctx, ctx->error_prepare_stack);
     for(i = 0; i < rt->class_count; i++) {
         JS_FreeValue(ctx, ctx->class_proto[i]);
@@ -6487,6 +6538,14 @@ JS_BOOL JS_HasException(JSContext *ctx)
     return !JS_IsUninitialized(ctx->rt->current_exception);
 }
 
+/* returns the pending backtrace (cannot be called twice). */
+JSValue JS_GetBacktrace(JSContext *ctx)
+{
+    JSValue val = ctx->error_back_trace;
+    ctx->error_back_trace = JS_UNDEFINED;
+    return val;
+}
+
 static void dbuf_put_leb128(DynBuf *s, uint32_t v)
 {
     uint32_t a;
@@ -6615,6 +6674,20 @@ static const char *get_func_name(JSContext *ctx, JSValue func)
     return JS_ToCString(ctx, val);
 }
 
+/* Note: it is important that no exception is returned by this function */
+static BOOL can_add_backtrace(JSValue obj)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return FALSE;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_ERROR)
+        return FALSE;
+    if (find_own_property1(p, JS_ATOM_stack))
+        return FALSE;
+    return TRUE;
+}
+
 #define JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL (1 << 0)
 /* only taken into account if filename is provided */
 #define JS_BACKTRACE_FLAG_SINGLE_LEVEL     (1 << 1)
@@ -6622,9 +6695,9 @@ static const char *get_func_name(JSContext *ctx, JSValue func)
 
 /* if filename != NULL, an additional level is added with the filename
    and line number information (used for parse error). */
-static void build_backtrace(JSContext *ctx, JSValue error_obj, JSValue filter_func,
-                            const char *filename, int line_num, int col_num,
-                            int backtrace_flags)
+void build_backtrace(JSContext *ctx, JSValue error_val, JSValue filter_func,
+                     const char *filename, int line_num, int col_num,
+                     int backtrace_flags)
 {
     JSStackFrame *sf, *sf_start;
     JSValue stack, prepare, saved_exception;
@@ -6767,7 +6840,7 @@ static void build_backtrace(JSContext *ctx, JSValue error_obj, JSValue filter_fu
             JS_FreeValue(ctx, csd[k].func_name);
         }
         JSValue args[] = {
-            error_obj,
+            error_val,
             stack,
         };
         JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
@@ -6788,35 +6861,30 @@ static void build_backtrace(JSContext *ctx, JSValue error_obj, JSValue filter_fu
     }
 
     rt->in_prepare_stack_trace = FALSE;
-    JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-}
-
-/* Note: it is important that no exception is returned by this function */
-static BOOL is_backtrace_needed(JSContext *ctx, JSValue obj)
-{
-    JSObject *p;
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        return FALSE;
-    p = JS_VALUE_GET_OBJ(obj);
-    if (p->class_id != JS_CLASS_ERROR)
-        return FALSE;
-    if (find_own_property1(p, JS_ATOM_stack))
-        return FALSE;
-    return TRUE;
+    if (JS_IsUndefined(ctx->error_back_trace))
+        ctx->error_back_trace = js_dup(stack);
+    if (can_add_backtrace(error_val)) {
+        JS_DefinePropertyValue(ctx, error_val, JS_ATOM_stack, stack,
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    }
 }
 
 JSValue JS_NewError(JSContext *ctx)
 {
-    return JS_NewObjectClass(ctx, JS_CLASS_ERROR);
+    JSValue obj = JS_NewObjectClass(ctx, JS_CLASS_ERROR);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, 0);
+    return obj;
 }
 
-static JSValue JS_MakeError(JSContext *ctx, JSErrorEnum error_num,
-                            const char *message, BOOL add_backtrace)
+JSValue JS_MakeError(JSContext *ctx, JSErrorEnum error_num,
+                     const char *message, JS_BOOL add_backtrace)
 {
     JSValue obj, msg;
 
     if (error_num == JS_PLAIN_ERROR) {
-        obj = JS_NewError(ctx);
+        return JS_NewObjectClass(ctx, JS_CLASS_ERROR);
     } else {
         obj = JS_NewObjectProtoClass(ctx, ctx->native_error_proto[error_num],
                                      JS_CLASS_ERROR);
@@ -7007,14 +7075,14 @@ static JSValue JS_ThrowTypeErrorNotASymbol(JSContext *ctx)
 static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
-    return JS_ThrowReferenceError(ctx, "%s is not defined",
+    return JS_ThrowReferenceError(ctx, "'%s' is not defined",
                                   JS_AtomGetStr(ctx, buf, sizeof(buf), name));
 }
 
 static JSValue JS_ThrowReferenceErrorUninitialized(JSContext *ctx, JSAtom name)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
-    return JS_ThrowReferenceError(ctx, "%s is not initialized",
+    return JS_ThrowReferenceError(ctx, "'%s' is not initialized",
                                   name == JS_ATOM_NULL ? "lexical variable" :
                                   JS_AtomGetStr(ctx, buf, sizeof(buf), name));
 }
@@ -7039,7 +7107,7 @@ static JSValue JS_ThrowTypeErrorInvalidClass(JSContext *ctx, int class_id)
     JSRuntime *rt = ctx->rt;
     JSAtom name;
     name = rt->class_array[class_id].class_name;
-    return JS_ThrowTypeErrorAtom(ctx, "%s object expected", name);
+    return JS_ThrowTypeErrorAtom(ctx, "'%s' object expected", name);
 }
 
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
@@ -7350,7 +7418,7 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
-static JSValue JS_GetPropertyInternal2(JSContext *ctx, JSValue obj,
+JSValue JS_GetPropertyInternal2(JSContext *ctx, JSValue obj,
                                        JSAtom prop, JSValue this_obj,
                                        JSInlineCacheUpdate *icu,
                                        BOOL throw_ref_error)
@@ -7422,6 +7490,8 @@ static JSValue JS_GetPropertyInternal2(JSContext *ctx, JSValue obj,
                     continue;
                 }
             } else {
+                if (JS_IsUndefined(pr->u.value) && ctx->handleUndefined)
+                    ctx->handleUndefined(ctx);
                 if (proto_depth == 0)
                     add_ic_slot(ctx, icu, prop, p, offset);
                 return js_dup(pr->u.value);
@@ -7498,7 +7568,7 @@ static JSValue JS_GetPropertyInternal2(JSContext *ctx, JSValue obj,
     }
 }
 
-static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValue obj,
+JSValue JS_GetPropertyInternal(JSContext *ctx, JSValue obj,
                                       JSAtom prop, JSValue this_obj,
                                       BOOL throw_ref_error)
 {
@@ -8679,7 +8749,7 @@ static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
    the new property is not added and an error is raised.
    'obj' must be an object when obj != this_obj.
    */
-static int JS_SetPropertyInternal2(JSContext *ctx, JSValue obj, JSAtom prop,
+int JS_SetPropertyInternal2(JSContext *ctx, JSValue obj, JSAtom prop,
                                    JSValue val, JSValue this_obj, int flags,
                                    JSInlineCacheUpdate *icu)
 {
@@ -8929,7 +8999,7 @@ fail:
     return -1;
 }
 
-static int JS_SetPropertyInternal(JSContext *ctx, JSValue this_obj,
+int JS_SetPropertyInternal(JSContext *ctx, JSValue this_obj,
                                   JSAtom prop, JSValue val, int flags)
 {
     return JS_SetPropertyInternal2(ctx, this_obj, prop, val, this_obj,
@@ -9899,6 +9969,11 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
             return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
         return js_dup(pr->u.value);
     }
+    if (ctx->scopeLookup) {
+        struct LookupResult result = ctx->scopeLookup(ctx, prop);
+        if (result.useResult)
+            return result.value;
+    }
     return JS_GetPropertyInternal(ctx, ctx->global_obj, prop,
                                  ctx->global_obj, throw_ref_error);
 }
@@ -9994,6 +10069,15 @@ static int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
     flags = JS_PROP_THROW_STRICT;
     if (is_strict_mode(ctx))
         flags |= JS_PROP_NO_ADD;
+
+    if (ctx->scopeLookup) {
+        struct LookupResult result = ctx->scopeLookup(ctx, prop);
+        if (result.useResult) {
+            JS_FreeValue(ctx, result.value);
+            return JS_SetPropertyInternal2(ctx, ctx->global_obj, prop, val, result.scope, flags, NULL);
+        }
+    }
+
     return JS_SetPropertyInternal(ctx, ctx->global_obj, prop, val, flags);
 }
 
@@ -10084,6 +10168,29 @@ BOOL JS_SetConstructorBit(JSContext *ctx, JSValue func_obj, BOOL val)
     p = JS_VALUE_GET_OBJ(func_obj);
     p->is_constructor = val;
     return TRUE;
+}
+
+JS_BOOL JS_IsRegExp(JSValue val)
+{
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return FALSE;
+    return JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_REGEXP;
+}
+
+JS_BOOL JS_IsMap(JSValue val)
+{
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return FALSE;
+    return JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_MAP;
+}
+
+int JS_IsSimpleValue(JSContext* ctx, JSValue v)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return 1;
+    p = JS_VALUE_GET_OBJ(v);
+    return p->class_id >= JS_CLASS_OBJECT && p->class_id <= JS_CLASS_BOOLEAN;
 }
 
 BOOL JS_IsError(JSContext *ctx, JSValue val)
@@ -10406,7 +10513,7 @@ static double js_strtod(const char *str, int radix, BOOL is_float)
             d = -d;
     } else {
     strtod_case:
-        d = strtod(str, NULL);
+        d = safe_strtod(str, NULL);
     }
     return d;
 }
@@ -11352,7 +11459,7 @@ static int js_ecvt(double d, int n_digits,
                n_digits+1:   'e' exponent mark
                n_digits+2..: exponent sign, value and null terminator
              */
-            if (strtod(dest, NULL) == d) {
+            if (safe_strtod(dest, NULL) == d) {
                 unsigned int n0 = n_digits;
                 /* enough digits */
                 /* strip the trailing zeros */
@@ -14975,6 +15082,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
     ctx = b->realm; /* set the current realm */
     ic = b->ic;
 
+    if (ctx->handleFunctionEntered)
+        ctx->handleFunctionEntered(ctx, this_obj);
+
 #ifdef DUMP_BYTECODE_STEP
     if (check_dump_flag(ctx->rt, DUMP_BYTECODE_STEP))
         print_func_name(b);
@@ -17412,13 +17522,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
         }
     }
  exception:
-    if (is_backtrace_needed(ctx, rt->current_exception)) {
-        /* add the backtrace information now (it is not done
-           before if the exception happens in a bytecode
-           operation */
-        sf->cur_pc = pc;
-        build_backtrace(ctx, rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
-    }
+    sf->cur_pc = pc;
+    build_backtrace(ctx, rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
     if (!JS_IsUncatchableError(ctx, rt->current_exception)) {
         while (sp > stack_buf) {
             JSValue val = *--sp;
@@ -17433,6 +17538,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
                 } else {
                     *sp++ = rt->current_exception;
                     rt->current_exception = JS_UNINITIALIZED;
+                    JS_FreeValueRT(rt, ctx->error_back_trace);
+                    ctx->error_back_trace = JS_UNDEFINED;
                     pc = b->byte_code_buf + pos;
                     goto restart;
                 }
@@ -17459,6 +17566,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
         }
     }
     rt->current_stack_frame = sf->prev_frame;
+    if (ctx->handleFunctionExited)
+        ctx->handleFunctionExited(ctx);
     return ret_val;
 }
 
@@ -20082,7 +20191,7 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             p++;
     }
     s->token.val = TOK_NUMBER;
-    s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    s->token.u.num.val = js_float64(safe_strtod((const char *)p_start, NULL));
     *pp = p;
     return 0;
 }
@@ -25532,6 +25641,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             js_parse_error(s, "line terminator not allowed after throw");
             goto fail;
         }
+        emit_source_loc(s);
         if (js_parse_expr(s))
             goto fail;
         emit_op(s, OP_throw);
@@ -33319,12 +33429,12 @@ static __exception int js_parse_program(JSParseState *s)
 
 static void js_parse_init(JSContext *ctx, JSParseState *s,
                           const char *input, size_t input_len,
-                          const char *filename)
+                          const char *filename, int line)
 {
     memset(s, 0, sizeof(*s));
     s->ctx = ctx;
     s->filename = filename;
-    s->line_num = 1;
+    s->line_num = line;
     s->col_num = 1;
     s->buf_start = s->buf_ptr = (const uint8_t *)input;
     s->buf_end = s->buf_ptr + input_len;
@@ -33376,7 +33486,7 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
 /* `export_name` and `input` may be pure ASCII or UTF-8 encoded */
 static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
                                  const char *input, size_t input_len,
-                                 const char *filename, int flags, int scope_idx)
+                                 const char *filename, int line, int flags, int scope_idx)
 {
     JSParseState s1, *s = &s1;
     int err, eval_type;
@@ -33388,7 +33498,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
     JSModuleDef *m;
     BOOL is_strict_mode;
 
-    js_parse_init(ctx, s, input, input_len, filename);
+    js_parse_init(ctx, s, input, input_len, filename, line);
     skip_shebang(&s->buf_ptr, s->buf_end);
 
     eval_type = flags & JS_EVAL_TYPE_MASK;
@@ -33418,7 +33528,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
             is_strict_mode = TRUE;
         }
     }
-    fd = js_new_function_def(ctx, NULL, TRUE, FALSE, filename, 1, 1);
+    fd = js_new_function_def(ctx, NULL, TRUE, FALSE, filename, line, 1);
     if (!fd)
         goto fail1;
     s->cur_func = fd;
@@ -33491,12 +33601,12 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
 /* the indirection is needed to make 'eval' optional */
 static JSValue JS_EvalInternal(JSContext *ctx, JSValue this_obj,
                                const char *input, size_t input_len,
-                               const char *filename, int flags, int scope_idx)
+                               const char *filename, int line, int flags, int scope_idx)
 {
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
-    return ctx->eval_internal(ctx, this_obj, input, input_len, filename,
+    return ctx->eval_internal(ctx, this_obj, input, input_len, filename, line,
                               flags, scope_idx);
 }
 
@@ -33512,7 +33622,7 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValue this_obj,
     str = JS_ToCStringLen(ctx, &len, val);
     if (!str)
         return JS_EXCEPTION;
-    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", flags, scope_idx);
+    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", 1, flags, scope_idx);
     JS_FreeCString(ctx, str);
     return ret;
 
@@ -33520,13 +33630,13 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValue this_obj,
 
 JSValue JS_EvalThis(JSContext *ctx, JSValue this_obj,
                     const char *input, size_t input_len,
-                    const char *filename, int eval_flags)
+                    const char *filename, int line, int eval_flags)
 {
     JSValue ret;
 
     assert((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL ||
            (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE);
-    ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename,
+    ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename, line,
                           eval_flags, -1);
     return ret;
 }
@@ -33534,7 +33644,7 @@ JSValue JS_EvalThis(JSContext *ctx, JSValue this_obj,
 JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
                 const char *filename, int eval_flags)
 {
-    return JS_EvalThis(ctx, ctx->global_obj, input, input_len, filename,
+    return JS_EvalThis(ctx, ctx->global_obj, input, input_len, filename, 1,
                        eval_flags);
 }
 
@@ -37174,6 +37284,13 @@ done:
 exception:
     js_free_prop_enum(ctx, props, len);
     return JS_EXCEPTION;
+}
+
+JSValue JS_ObjectSeal(JSContext *ctx, JSValueConst obj, int freeze)
+{
+    JSValueConst argv[] = {obj};
+    JS_FreeValue(ctx, js_object_seal(ctx, JS_UNDEFINED, 1, argv, freeze));
+    return obj;
 }
 
 static JSValue js_object_fromEntries(JSContext *ctx, JSValue this_val,
@@ -45149,7 +45266,7 @@ JSValue JS_ParseJSON(JSContext *ctx, const char *buf, size_t buf_len, const char
     JSParseState s1, *s = &s1;
     JSValue val = JS_UNDEFINED;
 
-    js_parse_init(ctx, s, buf, buf_len, filename);
+    js_parse_init(ctx, s, buf, buf_len, filename, 1);
     if (json_next_token(s))
         goto fail;
     val = json_parse_value(s);
@@ -48524,6 +48641,13 @@ JSValue JS_PromiseResult(JSContext *ctx, JSValue promise)
     return JS_DupValue(ctx, s->promise_result);
 }
 
+JS_BOOL JS_IsPromise(JSValue val)
+{
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return FALSE;
+    return JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_PROMISE;
+}
+
 static int js_create_resolving_functions(JSContext *ctx, JSValue *args,
                                          JSValue promise);
 
@@ -51264,6 +51388,13 @@ JSValue JS_NewDate(JSContext *ctx, double epoch_ms)
         return JS_EXCEPTION;
     JS_SetObjectData(ctx, obj, js_float64(time_clip(epoch_ms)));
     return obj;
+}
+
+JS_BOOL JS_IsDate(JSValue v)
+{
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return FALSE;
+    return JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_DATE;
 }
 
 void JS_AddIntrinsicDate(JSContext *ctx)
@@ -56074,7 +56205,7 @@ BOOL JS_DetectModule(const char *input, size_t input_len)
         return FALSE;
     }
     JS_AddIntrinsicRegExp(ctx); // otherwise regexp literals don't parse
-    val = __JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len, "<unnamed>",
+    val = __JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len, "<unnamed>", 1,
                             JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY, -1);
     if (JS_IsException(val)) {
         const char *msg = JS_ToCString(ctx, rt->current_exception);
@@ -56089,8 +56220,30 @@ BOOL JS_DetectModule(const char *input, size_t input_len)
     return is_module;
 }
 
+void setScopeLookup(JSContext *ctx, ScopeLookup *scopeLookup)
+{
+    ctx->scopeLookup = scopeLookup;
+}
+
+void setFoundUndefinedHandler(JSContext *ctx, FoundUndefinedHandler *handler)
+{
+    ctx->handleUndefined = handler;
+}
+
+void setFunctionEnteredHandler(JSContext *ctx, FunctionEnteredHandler *handler)
+{
+    ctx->handleFunctionEntered = handler;
+}
+
+void setFunctionExitedHandler(JSContext *ctx, FunctionExitedHandler *handler)
+{
+    ctx->handleFunctionExited = handler;
+}
+
 uintptr_t js_std_cmd(int cmd, ...) {
+    JSContext *ctx;
     JSRuntime *rt;
+    JSValue *pv;
     uintptr_t rv;
     va_list ap;
 
@@ -56104,6 +56257,12 @@ uintptr_t js_std_cmd(int cmd, ...) {
     case 1: // SetOpaque
         rt = va_arg(ap, JSRuntime *);
         rt->libc_opaque = va_arg(ap, void *);
+        break;
+    case 2: // ErrorBackTrace
+        ctx = va_arg(ap, JSContext *);
+        pv = va_arg(ap, JSValue *);
+        *pv = ctx->error_back_trace;
+        ctx->error_back_trace = JS_UNDEFINED;
         break;
     default:
         rv = -1;

@@ -40,6 +40,17 @@
 #include <fenv.h>
 #include <math.h>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#include <windows.h>
+#endif
+#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__) \
+    || defined(__APPLE__)
+#include <xlocale.h>
+#else
+#include <locale.h>
+#endif
+
 #include "cutils.h"
 #include "list.h"
 #include "quickjs.h"
@@ -115,6 +126,25 @@ const char* JS_GetVersion(void) {
 
 #undef STRINFIGY_
 #undef STRINGIFY
+
+static double safe_strtod(const char *restrict nptr, char **restrict endptr)
+{
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
+    setlocale(LC_NUMERIC, "C");
+#else
+    const locale_t tempLoc = newlocale(LC_NUMERIC_MASK, "C", 0);
+    uselocale(tempLoc);
+#endif
+    double d = strtod(nptr, endptr);
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    _configthreadlocale(_DISABLE_PER_THREAD_LOCALE);
+#else
+    uselocale(LC_GLOBAL_LOCALE);
+    freelocale(tempLoc);
+#endif
+    return d;
+}
 
 enum {
     /* classid tag        */    /* union usage   | properties */
@@ -441,8 +471,12 @@ struct JSContext {
     /* if NULL, eval is not supported */
     JSValue (*eval_internal)(JSContext *ctx, JSValue this_obj,
                              const char *input, size_t input_len,
-                             const char *filename, int flags, int scope_idx);
+                             const char *filename, int line, int flags, int scope_idx);
     void *user_opaque;
+    ScopeLookup *scopeLookup;
+    FoundUndefinedHandler *handleUndefined;
+    FunctionEnteredHandler *handleFunctionEntered;
+    FunctionExitedHandler *handleFunctionExited;
 };
 
 typedef union JSFloat64Union {
@@ -1255,7 +1289,7 @@ static void js_async_function_resolve_mark(JSRuntime *rt, JSValue val,
                                            JS_MarkFunc *mark_func);
 static JSValue JS_EvalInternal(JSContext *ctx, JSValue this_obj,
                                const char *input, size_t input_len,
-                               const char *filename, int flags, int scope_idx);
+                               const char *filename, int line, int flags, int scope_idx);
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
 static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                JS_MarkFunc *mark_func);
@@ -1384,8 +1418,6 @@ static JSValue js_int64(int64_t v)
     else
         return js_float64(v);
 }
-
-#define JS_NewInt64(ctx, val)  js_int64(val)
 
 static JSValue js_number(double d)
 {
@@ -2275,6 +2307,7 @@ void JS_FreeRuntime(JSRuntime *rt)
         JSMallocState *ms = &rt->malloc_state;
         rt->mf.js_free(ms->opaque, rt);
     }
+    fflush(stdout);
 }
 
 JSContext *JS_NewContextRaw(JSRuntime *rt)
@@ -6622,7 +6655,7 @@ static const char *get_func_name(JSContext *ctx, JSValue func)
 
 /* if filename != NULL, an additional level is added with the filename
    and line number information (used for parse error). */
-static void build_backtrace(JSContext *ctx, JSValue error_obj, JSValue filter_func,
+void build_backtrace(JSContext *ctx, JSValue error_obj, JSValue filter_func,
                             const char *filename, int line_num, int col_num,
                             int backtrace_flags)
 {
@@ -7422,6 +7455,8 @@ static JSValue JS_GetPropertyInternal2(JSContext *ctx, JSValue obj,
                     continue;
                 }
             } else {
+                if (JS_IsUndefined(pr->u.value) && ctx->handleUndefined)
+                    ctx->handleUndefined(ctx);
                 if (proto_depth == 0)
                     add_ic_slot(ctx, icu, prop, p, offset);
                 return js_dup(pr->u.value);
@@ -9899,6 +9934,11 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
             return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
         return js_dup(pr->u.value);
     }
+    if (ctx->scopeLookup) {
+        struct LookupResult result = ctx->scopeLookup(ctx, prop);
+        if (result.useResult)
+            return result.value;
+    }
     return JS_GetPropertyInternal(ctx, ctx->global_obj, prop,
                                  ctx->global_obj, throw_ref_error);
 }
@@ -9994,6 +10034,15 @@ static int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
     flags = JS_PROP_THROW_STRICT;
     if (is_strict_mode(ctx))
         flags |= JS_PROP_NO_ADD;
+
+    if (ctx->scopeLookup) {
+        struct LookupResult result = ctx->scopeLookup(ctx, prop);
+        if (result.useResult) {
+            JS_FreeValue(ctx, result.value);
+            return JS_SetPropertyInternal2(ctx, ctx->global_obj, prop, val, result.scope, flags, NULL);
+        }
+    }
+
     return JS_SetPropertyInternal(ctx, ctx->global_obj, prop, val, flags);
 }
 
@@ -10084,6 +10133,22 @@ BOOL JS_SetConstructorBit(JSContext *ctx, JSValue func_obj, BOOL val)
     p = JS_VALUE_GET_OBJ(func_obj);
     p->is_constructor = val;
     return TRUE;
+}
+
+JS_BOOL JS_IsRegExp(JSContext *ctx, JSValue val)
+{
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return FALSE;
+    return JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_REGEXP;
+}
+
+int JS_IsSimpleValue(JSContext* ctx, JSValue v)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return 1;
+    p = JS_VALUE_GET_OBJ(v);
+    return p->class_id >= JS_CLASS_OBJECT && p->class_id <= JS_CLASS_BOOLEAN;
 }
 
 BOOL JS_IsError(JSContext *ctx, JSValue val)
@@ -10406,7 +10471,7 @@ static double js_strtod(const char *str, int radix, BOOL is_float)
             d = -d;
     } else {
     strtod_case:
-        d = strtod(str, NULL);
+        d = safe_strtod(str, NULL);
     }
     return d;
 }
@@ -11352,7 +11417,7 @@ static int js_ecvt(double d, int n_digits,
                n_digits+1:   'e' exponent mark
                n_digits+2..: exponent sign, value and null terminator
              */
-            if (strtod(dest, NULL) == d) {
+            if (safe_strtod(dest, NULL) == d) {
                 unsigned int n0 = n_digits;
                 /* enough digits */
                 /* strip the trailing zeros */
@@ -14975,6 +15040,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
     ctx = b->realm; /* set the current realm */
     ic = b->ic;
 
+    if (ctx->handleFunctionEntered)
+        ctx->handleFunctionEntered(ctx, this_obj);
+
 #ifdef DUMP_BYTECODE_STEP
     if (check_dump_flag(ctx->rt, DUMP_BYTECODE_STEP))
         print_func_name(b);
@@ -17412,6 +17480,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
         }
     }
  exception:
+    if (JS_IsString(rt->current_exception)) {
+        JSValue error_obj = JS_NewError(ctx);
+        JSAtom msgProp = JS_NewAtom(ctx, "message");
+        JS_DefinePropertyValue(ctx, error_obj, msgProp, rt->current_exception, 0);
+        rt->current_exception = error_obj;
+        JS_FreeAtom(ctx, msgProp);
+    }
     if (is_backtrace_needed(ctx, rt->current_exception)) {
         /* add the backtrace information now (it is not done
            before if the exception happens in a bytecode
@@ -17459,6 +17534,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
         }
     }
     rt->current_stack_frame = sf->prev_frame;
+    if (ctx->handleFunctionExited)
+        ctx->handleFunctionExited(ctx);
     return ret_val;
 }
 
@@ -19007,7 +19084,7 @@ int __attribute__((format(printf, 2, 3))) js_parse_error(JSParseState *s, const 
     if (s->cur_func && s->cur_func->backtrace_barrier)
         backtrace_flags = JS_BACKTRACE_FLAG_SINGLE_LEVEL;
     build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, s->filename,
-                    s->line_num, s->col_num, backtrace_flags);
+                       s->line_num, s->col_num, backtrace_flags);
     return -1;
 }
 
@@ -20082,7 +20159,7 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             p++;
     }
     s->token.val = TOK_NUMBER;
-    s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    s->token.u.num.val = js_float64(safe_strtod((const char *)p_start, NULL));
     *pp = p;
     return 0;
 }
@@ -23480,10 +23557,10 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                 if (s->cur_func && s->cur_func->backtrace_barrier)
                     backtrace_flags = JS_BACKTRACE_FLAG_SINGLE_LEVEL;
                 build_backtrace(s->ctx, s->ctx->rt->current_exception, JS_UNDEFINED,
-                                s->filename,
-                                s->token.line_num,
-                                s->token.col_num,
-                                backtrace_flags);
+                                   s->filename,
+                                   s->token.line_num,
+                                   s->token.col_num,
+                                   backtrace_flags);
                 return -1;
             }
             ret = emit_push_const(s, str, 0);
@@ -33319,12 +33396,12 @@ static __exception int js_parse_program(JSParseState *s)
 
 static void js_parse_init(JSContext *ctx, JSParseState *s,
                           const char *input, size_t input_len,
-                          const char *filename)
+                          const char *filename, int line)
 {
     memset(s, 0, sizeof(*s));
     s->ctx = ctx;
     s->filename = filename;
-    s->line_num = 1;
+    s->line_num = line;
     s->col_num = 1;
     s->buf_start = s->buf_ptr = (const uint8_t *)input;
     s->buf_end = s->buf_ptr + input_len;
@@ -33376,7 +33453,7 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
 /* `export_name` and `input` may be pure ASCII or UTF-8 encoded */
 static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
                                  const char *input, size_t input_len,
-                                 const char *filename, int flags, int scope_idx)
+                                 const char *filename, int line, int flags, int scope_idx)
 {
     JSParseState s1, *s = &s1;
     int err, eval_type;
@@ -33388,7 +33465,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
     JSModuleDef *m;
     BOOL is_strict_mode;
 
-    js_parse_init(ctx, s, input, input_len, filename);
+    js_parse_init(ctx, s, input, input_len, filename, line);
     skip_shebang(&s->buf_ptr, s->buf_end);
 
     eval_type = flags & JS_EVAL_TYPE_MASK;
@@ -33418,7 +33495,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
             is_strict_mode = TRUE;
         }
     }
-    fd = js_new_function_def(ctx, NULL, TRUE, FALSE, filename, 1, 1);
+    fd = js_new_function_def(ctx, NULL, TRUE, FALSE, filename, line, 1);
     if (!fd)
         goto fail1;
     s->cur_func = fd;
@@ -33491,12 +33568,12 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValue this_obj,
 /* the indirection is needed to make 'eval' optional */
 static JSValue JS_EvalInternal(JSContext *ctx, JSValue this_obj,
                                const char *input, size_t input_len,
-                               const char *filename, int flags, int scope_idx)
+                               const char *filename, int line, int flags, int scope_idx)
 {
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
-    return ctx->eval_internal(ctx, this_obj, input, input_len, filename,
+    return ctx->eval_internal(ctx, this_obj, input, input_len, filename, line,
                               flags, scope_idx);
 }
 
@@ -33512,7 +33589,7 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValue this_obj,
     str = JS_ToCStringLen(ctx, &len, val);
     if (!str)
         return JS_EXCEPTION;
-    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", flags, scope_idx);
+    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", 1, flags, scope_idx);
     JS_FreeCString(ctx, str);
     return ret;
 
@@ -33520,13 +33597,13 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValue this_obj,
 
 JSValue JS_EvalThis(JSContext *ctx, JSValue this_obj,
                     const char *input, size_t input_len,
-                    const char *filename, int eval_flags)
+                    const char *filename, int line, int eval_flags)
 {
     JSValue ret;
 
     assert((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL ||
            (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE);
-    ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename,
+    ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename, line,
                           eval_flags, -1);
     return ret;
 }
@@ -33534,7 +33611,7 @@ JSValue JS_EvalThis(JSContext *ctx, JSValue this_obj,
 JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
                 const char *filename, int eval_flags)
 {
-    return JS_EvalThis(ctx, ctx->global_obj, input, input_len, filename,
+    return JS_EvalThis(ctx, ctx->global_obj, input, input_len, filename, 1,
                        eval_flags);
 }
 
@@ -37174,6 +37251,13 @@ done:
 exception:
     js_free_prop_enum(ctx, props, len);
     return JS_EXCEPTION;
+}
+
+JSValue JS_ObjectSeal(JSContext *ctx, JSValueConst obj, int freeze)
+{
+    JSValueConst argv[] = {obj};
+    JS_FreeValue(ctx, js_object_seal(ctx, JS_UNDEFINED, 1, argv, freeze));
+    return obj;
 }
 
 static JSValue js_object_fromEntries(JSContext *ctx, JSValue this_val,
@@ -45149,7 +45233,7 @@ JSValue JS_ParseJSON(JSContext *ctx, const char *buf, size_t buf_len, const char
     JSParseState s1, *s = &s1;
     JSValue val = JS_UNDEFINED;
 
-    js_parse_init(ctx, s, buf, buf_len, filename);
+    js_parse_init(ctx, s, buf, buf_len, filename, 1);
     if (json_next_token(s))
         goto fail;
     val = json_parse_value(s);
@@ -51266,6 +51350,13 @@ JSValue JS_NewDate(JSContext *ctx, double epoch_ms)
     return obj;
 }
 
+JS_BOOL JS_IsDate(JSValue v)
+{
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return FALSE;
+    return JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_DATE;
+}
+
 void JS_AddIntrinsicDate(JSContext *ctx)
 {
     JSValue obj;
@@ -56074,7 +56165,7 @@ BOOL JS_DetectModule(const char *input, size_t input_len)
         return FALSE;
     }
     JS_AddIntrinsicRegExp(ctx); // otherwise regexp literals don't parse
-    val = __JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len, "<unnamed>",
+    val = __JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len, "<unnamed>", 1,
                             JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY, -1);
     if (JS_IsException(val)) {
         const char *msg = JS_ToCString(ctx, rt->current_exception);
@@ -56087,6 +56178,26 @@ BOOL JS_DetectModule(const char *input, size_t input_len)
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return is_module;
+}
+
+void setScopeLookup(JSContext *ctx, ScopeLookup *scopeLookup)
+{
+    ctx->scopeLookup = scopeLookup;
+}
+
+void setFoundUndefinedHandler(JSContext *ctx, FoundUndefinedHandler *handler)
+{
+    ctx->handleUndefined = handler;
+}
+
+void setFunctionEnteredHandler(JSContext *ctx, FunctionEnteredHandler *handler)
+{
+    ctx->handleFunctionEntered = handler;
+}
+
+void setFunctionExitedHandler(JSContext *ctx, FunctionExitedHandler *handler)
+{
+    ctx->handleFunctionExited = handler;
 }
 
 uintptr_t js_std_cmd(int cmd, ...) {

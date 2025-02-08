@@ -672,10 +672,14 @@ JS_EXTERN JS_BOOL JS_IsFunction(JSContext* ctx, JSValue val);
 JS_EXTERN JS_BOOL JS_IsConstructor(JSContext* ctx, JSValue val);
 JS_EXTERN JS_BOOL JS_SetConstructorBit(JSContext *ctx, JSValue func_obj, JS_BOOL val);
 
+JS_EXTERN JS_BOOL JS_IsRegExp(JSContext* ctx, JSValueConst val);
+JS_EXTERN int JS_IsSimpleValue(JSContext* ctx, JSValue v);
+
 JS_EXTERN JSValue JS_NewArray(JSContext *ctx);
 JS_EXTERN int JS_IsArray(JSContext *ctx, JSValue val);
 
 JS_EXTERN JSValue JS_NewDate(JSContext *ctx, double epoch_ms);
+JS_EXTERN JS_BOOL JS_IsDate(JSValueConst v);
 
 JS_EXTERN JSValue JS_GetProperty(JSContext *ctx, JSValue this_obj, JSAtom prop);
 JS_EXTERN JSValue JS_GetPropertyUint32(JSContext *ctx, JSValue this_obj,
@@ -701,6 +705,7 @@ JS_EXTERN int JS_SetPrototype(JSContext *ctx, JSValue obj, JSValue proto_val);
 JS_EXTERN JSValue JS_GetPrototype(JSContext *ctx, JSValue val);
 JS_EXTERN int JS_GetLength(JSContext *ctx, JSValue obj, int64_t *pres);
 JS_EXTERN int JS_SetLength(JSContext *ctx, JSValue obj, int64_t len);
+JS_EXTERN JSValue JS_ObjectSeal(JSContext *ctx, JSValueConst obj, int freeze);
 
 #define JS_GPN_STRING_MASK  (1 << 0)
 #define JS_GPN_SYMBOL_MASK  (1 << 1)
@@ -739,7 +744,7 @@ JS_EXTERN JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
 /* same as JS_Eval() but with an explicit 'this_obj' parameter */
 JS_EXTERN JSValue JS_EvalThis(JSContext *ctx, JSValue this_obj,
                               const char *input, size_t input_len,
-                              const char *filename, int eval_flags);
+                              const char *filename, int line, int eval_flags);
 JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
 JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValue val, JSValue obj);
 JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValue this_obj,
@@ -957,6 +962,7 @@ static inline JSValue JS_NewCFunctionMagic(JSContext *ctx, JSCFunctionMagic *fun
     ft.generic_magic = func;
     return JS_NewCFunction2(ctx, ft.generic, name, length, cproto, magic);
 }
+
 JS_EXTERN void JS_SetConstructor(JSContext *ctx, JSValue func_obj,
                                  JSValue proto);
 
@@ -1042,6 +1048,28 @@ JS_EXTERN int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *exp
                                  JSValue val);
 JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
                                      const JSCFunctionListEntry *tab, int len);
+
+JS_EXTERN void build_backtrace(JSContext *ctx, JSValue error_obj, JSValue filter_func,
+                                  const char *filename, int line_num, int col_num,
+                                  int backtrace_flags);
+
+/* Qbs extensions */
+struct LookupResult
+{
+    JSValue value;
+    JSValue scope;
+    int useResult;
+};
+typedef struct LookupResult ScopeLookup(JSContext *ctx, JSAtom prop);
+void setScopeLookup(JSContext *ctx, ScopeLookup *scopeLookup);
+
+// Alternative: Request with throw in script engine
+typedef void FoundUndefinedHandler(JSContext *ctx);
+void setFoundUndefinedHandler(JSContext *ctx, FoundUndefinedHandler *handler);
+typedef void FunctionEnteredHandler(JSContext *ctx, JSValue this_val);
+typedef void FunctionExitedHandler(JSContext *ctx);
+void setFunctionEnteredHandler(JSContext *ctx, FunctionEnteredHandler *handler);
+void setFunctionExitedHandler(JSContext *ctx, FunctionExitedHandler *handler);
 
 /* Version */
 

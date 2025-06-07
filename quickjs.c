@@ -1435,6 +1435,9 @@ static JSValue js_dup(JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
+#ifndef NDEBUG
+        notifyRefCountIncrease(p);
+#endif
         p->ref_count++;
     }
     return unsafe_unconst(v);
@@ -5815,6 +5818,9 @@ void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
+#ifndef NDEBUG
+        notifyRefCountDecrease(p);
+#endif
         if (--p->ref_count <= 0) {
             js_free_value_rt(rt, v);
         }
@@ -57796,6 +57802,27 @@ void setFunctionExitedHandler(JSContext *ctx, FunctionExitedHandler *handler)
 {
     ctx->handleFunctionExited = handler;
 }
+
+#ifndef NDEBUG
+static void *watchedRefCount = NULL;
+
+void notifyRefCountIncrease(JSRefCountHeader *p)
+{
+    if (p == watchedRefCount)
+        fprintf(stderr, "increasing ref count %d for %p\n", p->ref_count, watchedRefCount);
+}
+
+void notifyRefCountDecrease(JSRefCountHeader *p)
+{
+    if (p == watchedRefCount)
+        fprintf(stderr, "decreasing ref count %d for %p\n", p->ref_count, watchedRefCount);
+}
+
+void watchRefCount(void *p)
+{
+    watchedRefCount = p;
+}
+#endif
 
 uintptr_t js_std_cmd(int cmd, ...) {
     JSContext *ctx;

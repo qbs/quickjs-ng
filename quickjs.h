@@ -1265,6 +1265,13 @@ typedef void FunctionExitedHandler(JSContext *ctx);
 void setFunctionEnteredHandler(JSContext *ctx, FunctionEnteredHandler *handler);
 void setFunctionExitedHandler(JSContext *ctx, FunctionExitedHandler *handler);
 
+#ifndef NDEBUG
+typedef struct JSRefCountHeader JSRefCountHeader;
+void notifyRefCountIncrease(JSRefCountHeader *p);
+void notifyRefCountDecrease(JSRefCountHeader *p);
+#endif
+
+
 /* Version */
 
 #define QJS_VERSION_MAJOR 0
